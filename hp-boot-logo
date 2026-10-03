@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+ESP=/boot/EFI/logo
+MAX=32751
+LOADER='\EFI\logo\Shell_Full.efi'
+SHELL_SRC=/usr/share/edk2-shell/x64/Shell_Full.efi
+LOGO_SRC=$ROOT/efi/CustomLogoApp.efi
+
+usage() {
+  echo "Usage: hp-boot-logo <image> | --clear"
+  echo "Next reboot applies it. JPEG, max 1024x768, max 32KB."
+  exit 1
+}
+
+[[ $# -eq 1 ]] || usage
+[[ $1 == -h || $1 == --help ]] && usage
+
+if [[ $1 != --clear ]]; then
+  [[ -f $1 ]] || { echo "not a file: $1" >&2; exit 1; }
+  set -- "$(readlink -f "$1")"
+fi
+
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  exec sudo -E "$ROOT/hp-boot-logo" "$@"
+fi
+
+src=$(findmnt -n -o SOURCE /boot)
+disk=/dev/$(lsblk -no PKNAME "$src")
+part=$(lsblk -no PARTN "$src")
+
+install -d -m 0755 "$ESP"
+
+if [[ ! -f $ESP/Shell_Full.efi ]]; then
+  [[ -f $SHELL_SRC ]] || { echo "install edk2-shell, or copy Shell_Full.efi to $ESP" >&2; exit 1; }
+  install -m 0644 "$SHELL_SRC" "$ESP/Shell_Full.efi"
+fi
+if [[ ! -f $ESP/CustomLogoApp.efi ]]; then
+  [[ -f $LOGO_SRC ]] || { echo "copy HP CustomLogoApp.efi to $LOGO_SRC" >&2; exit 1; }
+  install -m 0644 "$LOGO_SRC" "$ESP/CustomLogoApp.efi"
+fi
+
+write_nsh() {
+  local cmd=$1
+  printf 'echo -off\r\nfor %%i in 0 1 2 3 4 5 6 7\r\n  if exist fs%%i:\\EFI\\logo\\CustomLogoApp.efi then\r\n    fs%%i:\r\n    cd \\EFI\\logo\r\n    %s > logo.log\r\n    reset\r\n  endif\r\nendfor\r\nexit\r\n' "$cmd" > "$ESP/startup.nsh"
+}
+
+if [[ $1 == --clear ]]; then
+  write_nsh "CustomLogoApp.efi -e"
+  echo "default HP logo queued"
+else
+  tmp=$(mktemp --suffix=.jpg)
+  work=$(mktemp --suffix=.png)
+  trap 'rm -f "$tmp" "$work"' EXIT
+  magick "$1" -resize '1024x768>' "$work"
+  read -r w h < <(magick "$work" -format '%w %h\n' info:)
+  read -r cr cg cb < <(magick "$work" -format '%[fx:int(255*p{0,0}.r)] %[fx:int(255*p{0,0}.g)] %[fx:int(255*p{0,0}.b)]\n' info:)
+  if (( cr < 40 && cg < 40 && cb < 40 )); then
+    magick "$work" -fuzz 14% -fill '#000000' \
+      -draw "color 0,0 floodfill" \
+      -draw "color $((w - 1)),0 floodfill" \
+      -draw "color 0,$((h - 1)) floodfill" \
+      -draw "color $((w - 1)),$((h - 1)) floodfill" \
+      -bordercolor '#000000' -border 2 -shave 2x2 "$work"
+  fi
+  q=90
+  while true; do
+    magick "$work" -interlace None -strip -sampling-factor 1x1 -quality "$q" "JPEG:$tmp"
+    sz=$(stat -c%s "$tmp")
+    (( sz <= MAX )) && break
+    q=$((q - 10))
+    (( q >= 20 )) || { echo "still ${sz} bytes after compression (max $MAX)" >&2; exit 1; }
+  done
+  install -m 0644 "$tmp" "$ESP/logo.jpg"
+  write_nsh "CustomLogoApp.efi logo.jpg"
+  echo "queued ${sz} bytes, quality $q"
+fi
+
+sync
+id=$(efibootmgr -v | grep -F 'EFI\logo\Shell_Full.efi' | sed -n 's/^Boot\([0-9A-Fa-f]*\).*/\1/p' | head -1)
+if [[ -z $id ]]; then
+  before=$(efibootmgr | awk -F': ' '/^BootOrder/{print $2}' | tr -d ' ')
+  efibootmgr -c -d "$disk" -p "$part" -L "HP boot logo" -l "$LOADER" >/dev/null
+  id=$(efibootmgr -v | grep -F 'EFI\logo\Shell_Full.efi' | sed -n 's/^Boot\([0-9A-Fa-f]*\).*/\1/p' | head -1)
+  efibootmgr -o "${before},${id}" >/dev/null
+fi
+efibootmgr -n "$id" >/dev/null
+echo "reboot to apply"
